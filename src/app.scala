@@ -2,51 +2,109 @@ package ork.app
 
 import zio.*
 import zio.Console.*
+import mainargs.{main as cmd, arg, Flag, ParserForMethods, ParserForClass}
 import ork.domain.*
 import ork.task.*
 import ork.mcp.{McpServer, TaskRef}
+
+object FlowCommands:
+  @cmd(doc = "Create a new task")
+  def create(
+    @arg(positional = true, doc = "Task name")      name   : String,
+    @arg(positional = true, doc = "Initial prompt")  prompt : String = "",
+    @arg(doc = "Launch claude immediately")           run    : Flag
+  ): (String, String, Boolean) = (name, prompt, run.value)
+
+  @cmd(doc = "Finish a task (merge into base branch)")
+  def finish(
+    @arg(positional = true, doc = "Task name") name : String
+  ): (String, String) = ("finish", name)
+
+  @cmd(doc = "Delete a task")
+  def delete(
+    @arg(positional = true, doc = "Task name") name : String
+  ): (String, String) = ("delete", name)
+
+object TopCommands:
+  @cmd(doc = "List all tasks")
+  def list(): String = "list"
+
+  @cmd(doc = "Show task details")
+  def info(
+    @arg(positional = true, doc = "Task name") name : String
+  ): (String, String) = ("info", name)
+
+  @cmd(doc = "Resume a claude session")
+  def resume(
+    @arg(positional = true, doc = "Task name") name : String
+  ): (String, String) = ("resume", name)
+
+  @cmd(doc = "Open task in an IDE")
+  def open(
+    @arg(positional = true, doc = "Task name") name : String,
+    @arg(doc = "Open in IntelliJ IDEA")         idea : Flag,
+    @arg(doc = "Open in VS Code")               code : Flag
+  ): (String, String, Boolean, Boolean) = ("open", name, idea.value, code.value)
+
+@cmd case class TaskAddRepoArgs(
+  @arg(doc = "Task identifier (flow/name)")      task : String,
+  @arg(positional = true, doc = "Repo name")     repo : String
+)
+
+@cmd case class McpArgs(
+  @arg(doc = "Task identifier (flow/name)") task : String
+)
 
 object Ork:
 
   def run(args: Seq[String]): Task[Unit] =
     args.toList match
-      case "mcp" :: rest => runMcp(rest)
-      case other         => runCommand(other)
+      case "mcp" :: rest                          => runMcp(rest)
+      case flow :: rest if isFlow(flow)           => runFlow(toFlow(flow), rest)
+      case "task" :: "add-repo" :: rest           => runAddRepo(rest.toArray)
+      case other                                  => runTop(other.toArray)
 
   private def runMcp(args: List[String]): Task[Unit] =
-    args match
-      case "--task" :: name :: Nil => McpServer.run(name)
-      case _                      => ZIO.fail(new Exception("Usage: ork mcp --task <name>"))
+    val parsed = ParserForClass[McpArgs].constructOrThrow(args.toArray)
+    McpServer.run(parsed.task)
 
-  private def runCommand(args: List[String]): Task[Unit] =
-
-    def parseCommand(args: List[String]): Task[Command] =
-      val hasRun  = args.contains("--run")
-      val cleaned = args.filterNot(_ == "--run")
-
-      cleaned match
-        case flow :: "create" :: name :: prompt :: Nil if isFlow(flow) => ZIO.succeed(CreateCommand(toFlow(flow), name, Some(prompt), run = hasRun))
-        case flow :: "create" :: name :: Nil           if isFlow(flow) => ZIO.succeed(CreateCommand(toFlow(flow), name, run = hasRun))
-        case flow :: "create" :: Nil                   if isFlow(flow) => ZIO.fail(new Exception(s"Usage: ork $flow create [--run] <name> [prompt]"))
-        case flow :: "delete" :: name :: Nil           if isFlow(flow) => ZIO.succeed(DeleteCommand(toFlow(flow), name))
-        case flow :: "delete" :: Nil                   if isFlow(flow) => ZIO.fail(new Exception(s"Usage: ork $flow delete <name>"))
-        case "task" :: "add-repo" :: "--task" :: task :: repo :: Nil   => parseTaskRef(task).map(ref => AddRepoCommand(ref.flowType, ref.name, repo))
-        case "task" :: "add-repo" :: _                                 => ZIO.fail(new Exception("Usage: ork task add-repo --task <flow/name> <repo>"))
-        case "list" :: Nil                                             => ZIO.succeed(ListCommand())
-        case "info" :: name :: Nil                                     => ZIO.succeed(InfoCommand(name))
-        case "info" :: Nil                                             => ZIO.fail(new Exception("Usage: ork info <name>"))
-        case "resume" :: name :: Nil                                   => ZIO.succeed(ResumeCommand(name))
-        case "resume" :: Nil                                           => ZIO.fail(new Exception("Usage: ork resume <name>"))
-        case cmd :: _                                                  => ZIO.fail(new Exception(s"Unknown command: '$cmd'. Available: feature, hotfix, release, list, task"))
-        case Nil                                                       => ZIO.fail(new Exception("Usage: ork <feature|hotfix|release> create [--run] <name> [prompt]"))
-
+  private def runFlow(flowType: FlowType, args: List[String]): Task[Unit] =
+    val command = ParserForMethods(FlowCommands).runOrThrow(args.toArray)
+    val cmd = command match
+      case (name: String, prompt: String, run: Boolean) =>
+        val p = if prompt.isEmpty then None else Some(prompt)
+        CreateCommand(flowType, name, p, run)
+      case ("finish", name: String) =>
+        FinishCommand(flowType, name)
+      case ("delete", name: String) =>
+        DeleteCommand(flowType, name)
     for
-      command <- parseCommand(args)
-      result  <- command.execute
-      _       <- printLine(result)
+      result <- cmd.execute
+      _      <- printLine(result)
     yield ()
 
-  private def isFlow(s: String): Boolean    = FlowType.fromString(s).isDefined
+  private def runAddRepo(args: Array[String]): Task[Unit] =
+    val parsed = ParserForClass[TaskAddRepoArgs].constructOrThrow(args)
+    for
+      ref    <- ZIO.fromEither(TaskRef.parse(parsed.task)).mapError(msg => new Exception(msg))
+      cmd     = AddRepoCommand(ref.flowType, ref.name, parsed.repo)
+      result <- cmd.execute
+      _      <- printLine(result)
+    yield ()
+
+  private def runTop(args: Array[String]): Task[Unit] =
+    val command = ParserForMethods(TopCommands).runOrThrow(args)
+    val cmd: Command = command match
+      case "list"                                             => ListCommand()
+      case ("info", name: String)                             => InfoCommand(name)
+      case ("resume", name: String)                           => ResumeCommand(name)
+      case ("open", name: String, idea: Boolean, code: Boolean) =>
+        val ide = if code then Ide.VsCode else Ide.IntelliJ
+        OpenCommand(name, ide)
+    for
+      result <- cmd.execute
+      _      <- printLine(result)
+    yield ()
+
+  private def isFlow(s: String): Boolean   = FlowType.fromString(s).isDefined
   private def toFlow(s: String): FlowType  = FlowType.fromString(s).get
-  private def parseTaskRef(s: String): Task[TaskRef] =
-    ZIO.fromEither(TaskRef.parse(s)).mapError(msg => new Exception(msg))

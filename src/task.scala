@@ -46,6 +46,36 @@ object TaskPaths:
                      .mapError(msg => new Exception(s"Invalid config: $msg"))
       yield config
 
+enum Ide:
+  case IntelliJ, VsCode
+
+case class OpenCommand(name: String, ide: Ide) extends Command:
+
+  override def execute: Task[String] =
+    for
+      found   <- ZIO.attempt(TaskPaths.findTask(name))
+      (ft, m) <- found match
+                   case Seq()    => ZIO.fail(new Exception(s"Task '$name' not found"))
+                   case Seq(one) => ZIO.succeed(one)
+                   case multiple =>
+                     val types = multiple.map(_._1.branchPrefix).mkString(", ")
+                     ZIO.fail(new Exception(s"Task '$name' exists in multiple types: $types"))
+      taskDir  = TaskPaths.taskDir(ft, name)
+      _       <- ide match
+                   case Ide.IntelliJ =>
+                     ZIO.attempt {
+                       import sys.process.*
+                       Process(Seq("open", "-na", "IntelliJ IDEA", "--args", taskDir.canonicalPath)).!
+                     }
+                   case Ide.VsCode =>
+                     val wsFile = taskDir / s"$name.code-workspace"
+                     if !wsFile.exists then ZIO.fail(new Exception(s"No workspace file found. Add a repo first."))
+                     else ZIO.attempt {
+                       import sys.process.*
+                       Process(Seq("code", wsFile.canonicalPath)).!
+                     }
+    yield s"Opening '$name' in ${ide.toString}"
+
 case class ResumeCommand(name: String) extends Command:
 
   override def execute: Task[String] =
@@ -122,21 +152,22 @@ case class InfoCommand(name: String) extends Command:
     val typeColor = colorForType(ft)
     val sb = new StringBuilder
 
-    sb.append(s"${BOLD}${typeColor}${ft.branchPrefix}${RESET}${BOLD}/$name${RESET}\n")
-    sb.append(s"\n")
-    sb.append(s"  Status:   ${colorForStatus(m.status)}${m.status.toString.toLowerCase}${RESET}\n")
-    sb.append(s"  Branch:   ${CYAN}${m.branch}${RESET}\n")
-    sb.append(s"  Base:     ${m.flowType.baseBranch}\n")
-    sb.append(s"  Created:  ${m.created}\n")
+    for
+      config  <- TaskPaths.loadConfig
+      changes <- ZIO.foreach(m.repos)(r => repoChanges(r).map(c => (r, c)))
+    yield
+      sb.append(s"${BOLD}${typeColor}${ft.branchPrefix}${RESET}${BOLD}/$name${RESET}\n")
+      sb.append(s"\n")
+      sb.append(s"  Status:   ${colorForStatus(m.status)}${m.status.toString.toLowerCase}${RESET}\n")
+      sb.append(s"  Branch:   ${CYAN}${m.branch(config.developer)}${RESET}\n")
+      sb.append(s"  Base:     ${m.flowType.baseBranch}\n")
+      sb.append(s"  Created:  ${m.created}\n")
 
-    if m.description.nonEmpty then
-      sb.append(s"  Desc:     ${m.description}\n")
+      if m.description.nonEmpty then
+        sb.append(s"  Desc:     ${m.description}\n")
 
-    if m.repos.nonEmpty then
-      sb.append(s"\n  ${BOLD}Repositories${RESET}\n")
-      for
-        changes <- ZIO.foreach(m.repos)(r => repoChanges(r).map(c => (r, c)))
-      yield
+      if m.repos.nonEmpty then
+        sb.append(s"\n  ${BOLD}Repositories${RESET}\n")
         changes.foreach { (r, c) =>
           sb.append(s"\n  ${BOLD}${r.name}${RESET}\n")
           sb.append(s"    Origin:      ${DIM}${r.origin}${RESET}\n")
@@ -151,28 +182,21 @@ case class InfoCommand(name: String) extends Command:
               log.linesIterator.foreach(l => sb.append(s"      ${YELLOW}${l}${RESET}\n"))
               sb.append(s"    ${BOLD}Stats${RESET}\n")
               stat.linesIterator.foreach(l => sb.append(s"      ${l}\n"))
-
           readChangelog(ft, r.name).foreach { cl =>
             sb.append(s"    ${BOLD}Changelog${RESET}\n")
             cl.linesIterator.foreach(l => sb.append(s"      ${l}\n"))
           }
         }
+      else
+        sb.append(s"\n  ${DIM}No repositories added yet.${RESET}\n")
 
-        if m.sessions.nonEmpty then
-          sb.append(s"\n  ${BOLD}Sessions${RESET}\n")
-          m.sessions.foreach { s =>
-            sb.append(s"    ${s.date} ${DIM}(${s.id})${RESET}\n")
-          }
-
-        sb.toString
-    else
-      sb.append(s"\n  ${DIM}No repositories added yet.${RESET}\n")
       if m.sessions.nonEmpty then
         sb.append(s"\n  ${BOLD}Sessions${RESET}\n")
         m.sessions.foreach { s =>
           sb.append(s"    ${s.date} ${DIM}(${s.id})${RESET}\n")
         }
-      ZIO.succeed(sb.toString)
+
+      sb.toString
 
 case class ListCommand() extends Command:
 
@@ -230,6 +254,51 @@ case class ListCommand() extends Command:
 
         val separator = widths.map("-" * _).mkString("  ")
         (lines.head :: separator :: lines.tail.toList).mkString("\n")
+
+case class FinishCommand(flowType: FlowType, name: String) extends Command:
+
+  override def execute: Task[String] =
+    val dir  = TaskPaths.taskDir(flowType, name)
+    val file = TaskPaths.manifest(flowType, name)
+
+    for
+      _        <- ZIO.fail(new Exception(s"${flowType.toString} '$name' not found"))
+                    .when(!dir.exists)
+      config   <- TaskPaths.loadConfig
+      content  <- ZIO.attempt(file.contentAsString)
+      manifest <- ZIO.fromEither(content.fromJson[TaskManifest])
+                    .mapError(msg => new Exception(s"Invalid manifest: $msg"))
+      branch    = manifest.branch(config.developer)
+      results  <- ZIO.foreach(manifest.repos)(repo => finishRepo(repo, branch).map(r => (repo, r)))
+      _        <- updateStatus(file, manifest)
+    yield
+      val summary = results.map { (repo, result) =>
+        s"  ${repo.name}: $result"
+      }.mkString("\n")
+      s"${flowType.toString} '$name' finished.\n$summary"
+
+  private def finishRepo(repo: RepoEntry, branch: String): Task[String] =
+    val originDir = better.files.File(repo.origin)
+    val git       = ork.repo.Repos.runGit(originDir, _)
+    for
+      // Save current branch to restore later
+      current    <- ork.repo.Repos.currentBranch(originDir)
+      // Switch to base branch and merge
+      _          <- git(s"git checkout ${repo.baseBranch}")
+      _          <- git(s"git merge --no-ff $branch -m \"Merge $branch into ${repo.baseBranch}\"")
+                      .catchAll { err =>
+                        // Abort merge and restore on failure
+                        git("git merge --abort").ignore *>
+                        git(s"git checkout $current").ignore *>
+                        ZIO.fail(err)
+                      }
+      // Remove worktree and branch
+      _          <- ork.worktree.Worktrees.remove(repo)
+    yield "merged"
+
+  private def updateStatus(file: better.files.File, manifest: TaskManifest): Task[Unit] =
+    val updated = manifest.copy(status = TaskStatus.Finished)
+    ZIO.attempt(file.overwrite(updated.toJsonPretty)).unit
 
 case class DeleteCommand(flowType: FlowType, name: String) extends Command:
 
@@ -319,6 +388,8 @@ case class CreateCommand(flowType: FlowType, name: String, initialPrompt: Option
       _      <- ZIO.attempt(TaskPaths.log(flowType, name).overwrite(s"# Task: $name\n"))
       _      <- ZIO.attempt(TaskPaths.mcpConfig(flowType, name).overwrite(mcpJson))
       _      <- ZIO.attempt(TaskPaths.promptFile(flowType, name).overwrite(prompt))
+      _      <- ZIO.attempt(ork.ide.IdeaProject.generate(flowType, name, Seq.empty, config))
+      _      <- ZIO.attempt(ork.ide.VsCodeWorkspace.generate(flowType, name, Seq.empty, config))
       msg     = s"""${flowType.toString} '$name' created at ${dir.canonicalPath}
                    |  Branch: $branch (from ${flowType.baseBranch})
                    |

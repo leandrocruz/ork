@@ -68,11 +68,12 @@ object TaskManifest:
 
 case class OrkConfig(
   developer : Option[String] = None,
+  jdk       : Option[String] = None,
   roots     : Seq[String]
 ) derives JsonCodec
 
 object OrkConfig:
-  val empty: OrkConfig = OrkConfig(developer = None, roots = Seq.empty)
+  val empty: OrkConfig = OrkConfig(developer = None, jdk = None, roots = Seq.empty)
 
 trait Command:
   def execute: zio.Task[String]

@@ -41,8 +41,8 @@ object Worktrees:
                       baseCommit = baseCommit
                     )
       updated    <- updateManifest(flowType, taskName, manifest, entry)
-      _          <- ZIO.attempt(ork.ide.IdeaProject.generate(flowType, taskName, updated.repos))
-      _          <- ZIO.attempt(ork.ide.VsCodeWorkspace.generate(flowType, taskName, updated.repos))
+      _          <- ZIO.attempt(ork.ide.IdeaProject.generate(flowType, taskName, updated.repos, config))
+      _          <- ZIO.attempt(ork.ide.VsCodeWorkspace.generate(flowType, taskName, updated.repos, config))
     yield entry
 
   def remove(repo: RepoEntry): Task[Unit] =
