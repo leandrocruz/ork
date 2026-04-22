@@ -29,3 +29,10 @@
 - `--allowedTools` pre-approves all ork MCP tools and CLI commands
 - CLI parsing via mainargs with `--help` support
 - `baseCommit` stored in manifest for each repo (HEAD of base branch at worktree creation)
+- `ork feature export <name>` / `ork hotfix export` / `ork release export` — exports a task to a portable `.ork-task.json` file for transfer to another host. Pushes branches to remote, bundles changelogs and session notes
+- `ork import <file>` — imports a task from an `.ork-task.json` file. Resolves repos locally, fetches branches, creates worktrees, regenerates all config files
+- Auto-generated `sbt.xml` in IntelliJ `.idea` project — links each sbt-based worktree as a linked sbt project so IntelliJ auto-imports sources, dependencies, and Scala compiler settings. Detects sbt version from `project/build.properties`
+
+### Changed
+
+- `ork list` sorts tasks by status (Active first, then Paused, Finished, Aborted), then alphabetically by task name within each group

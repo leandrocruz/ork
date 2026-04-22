@@ -25,6 +25,11 @@ object FlowCommands:
     @arg(positional = true, doc = "Task name") name : String
   ): (String, String) = ("delete", name)
 
+  @cmd(doc = "Export a task for transfer to another host")
+  def `export`(
+    @arg(positional = true, doc = "Task name") name : String
+  ): (String, String) = ("export", name)
+
 object TopCommands:
   @cmd(doc = "List all tasks")
   def list(): String = "list"
@@ -45,6 +50,11 @@ object TopCommands:
     @arg(doc = "Open in IntelliJ IDEA")         idea : Flag,
     @arg(doc = "Open in VS Code")               code : Flag
   ): (String, String, Boolean, Boolean) = ("open", name, idea.value, code.value)
+
+  @cmd(doc = "Import a task from an export file")
+  def `import`(
+    @arg(positional = true, doc = "Path to .ork-task.json file") file : String
+  ): (String, String) = ("import", file)
 
 @cmd case class TaskAddRepoArgs(
   @arg(doc = "Task identifier (flow/name)")      task : String,
@@ -78,6 +88,8 @@ object Ork:
         FinishCommand(flowType, name)
       case ("delete", name: String) =>
         DeleteCommand(flowType, name)
+      case ("export", name: String) =>
+        ExportCommand(flowType, name)
     for
       result <- cmd.execute
       _      <- printLine(result)
@@ -101,6 +113,8 @@ object Ork:
       case ("open", name: String, idea: Boolean, code: Boolean) =>
         val ide = if code then Ide.VsCode else Ide.IntelliJ
         OpenCommand(name, ide)
+      case ("import", file: String) =>
+        ImportCommand(file)
     for
       result <- cmd.execute
       _      <- printLine(result)

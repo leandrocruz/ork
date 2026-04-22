@@ -66,6 +66,26 @@ object TaskManifest:
       sessions    = Seq.empty
     )
 
+case class PortableRepoEntry(
+  name       : String,
+  remote     : String,
+  branch     : String,
+  baseBranch : String,
+  baseCommit : String
+) derives JsonCodec
+
+case class PortableTask(
+  task         : String,
+  flowType     : FlowType,
+  description  : String,
+  created      : String,
+  status       : TaskStatus,
+  repos        : Seq[PortableRepoEntry],
+  sessions     : Seq[SessionEntry],
+  changelogs   : Map[String, String],
+  sessionNotes : Map[String, String]
+) derives JsonCodec
+
 case class OrkConfig(
   developer : Option[String] = None,
   jdk       : Option[String] = None,

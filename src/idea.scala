@@ -65,6 +65,10 @@ object IdeaProject:
     (ideaDir / "vcs.xml").overwrite(vcsXml(repos))
     repos.foreach(r => (ideaDir / s"${r.name}.iml").overwrite(moduleIml(r.name)))
 
+    val sbtRepos = repos.filter(r => (File(r.worktree) / "build.sbt").exists)
+    if sbtRepos.nonEmpty then
+      (ideaDir / "sbt.xml").overwrite(sbtXml(sbtRepos))
+
   private def miscXml(jdk: String): String =
     s"""<?xml version="1.0" encoding="UTF-8"?>
        |<project version="4">
@@ -101,6 +105,40 @@ object IdeaProject:
        |$mappings
        |  </component>
        |</project>""".stripMargin
+
+  private def sbtXml(repos: Seq[RepoEntry]): String =
+    val projects = repos.map { r =>
+      val version = detectSbtVersion(r)
+      s"""      <SbtProjectSettings>
+         |        <option name="converterVersion" value="2" />
+         |        <option name="externalProjectPath" value="$$PROJECT_DIR$$/worktrees/${r.name}" />
+         |        <option name="modules">
+         |          <set>
+         |            <option value="$$PROJECT_DIR$$/worktrees/${r.name}" />
+         |            <option value="$$PROJECT_DIR$$/worktrees/${r.name}/project" />
+         |          </set>
+         |        </option>
+         |        <option name="sbtVersion" value="$version" />
+         |      </SbtProjectSettings>""".stripMargin
+    }.mkString("\n")
+
+    s"""<?xml version="1.0" encoding="UTF-8"?>
+       |<project version="4">
+       |  <component name="ScalaSbtSettings">
+       |    <option name="linkedExternalProjectsSettings">
+       |$projects
+       |    </option>
+       |  </component>
+       |</project>""".stripMargin
+
+  private def detectSbtVersion(repo: RepoEntry): String =
+    val props = File(repo.worktree) / "project" / "build.properties"
+    if props.exists then
+      props.contentAsString.linesIterator
+        .find(_.startsWith("sbt.version="))
+        .map(_.stripPrefix("sbt.version=").trim)
+        .getOrElse("1.10.1")
+    else "1.10.1"
 
   private def moduleIml(repoName: String): String =
     s"""<?xml version="1.0" encoding="UTF-8"?>

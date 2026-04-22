@@ -227,7 +227,14 @@ case class ListCommand() extends Command:
       if tasks.isEmpty then "No tasks found."
       else
         val header = (s"${BOLD}Type${RESET}", s"${BOLD}Name${RESET}", s"${BOLD}Status${RESET}", s"${BOLD}Branch${RESET}", s"${BOLD}Repos${RESET}", s"${BOLD}Created${RESET}")
-        val rows = tasks.map { (ft, m) =>
+        def statusOrder(s: TaskStatus): Int = s match
+          case TaskStatus.Active   => 0
+          case TaskStatus.Paused   => 1
+          case TaskStatus.Finished => 2
+          case TaskStatus.Aborted  => 3
+
+        val sorted = tasks.sortBy((ft, m) => (statusOrder(m.status), m.task))
+        val sortedRows = sorted.map { (ft, m) =>
           val typeCol   = s"${colorForType(ft)}${ft.branchPrefix}${RESET}"
           val nameCol   = m.task
           val statusCol = s"${colorForStatus(m.status)}${m.status.toString.toLowerCase}${RESET}"
@@ -237,7 +244,7 @@ case class ListCommand() extends Command:
           (typeCol, nameCol, statusCol, branchCol, reposCol, dateCol)
         }
 
-        val all = header +: rows
+        val all = header +: sortedRows
 
         // Calculate widths based on visible (non-ANSI) lengths
         def visible(s: String): Int = s.replaceAll("\u001b\\[[0-9;]*m", "").length
@@ -326,6 +333,227 @@ case class AddRepoCommand(flowType: FlowType, taskName: String, repoName: String
              |  Worktree: ${entry.worktree}
              |  Branch:   ${entry.branch}
              |  Base:     ${entry.baseBranch}""".stripMargin
+
+case class ExportCommand(flowType: FlowType, name: String) extends Command:
+
+  override def execute: Task[String] =
+    val dir  = TaskPaths.taskDir(flowType, name)
+    val file = TaskPaths.manifest(flowType, name)
+
+    for
+      _        <- ZIO.fail(new Exception(s"${flowType.toString} '$name' not found"))
+                    .when(!dir.exists)
+      content  <- ZIO.attempt(file.contentAsString)
+      manifest <- ZIO.fromEither(content.fromJson[TaskManifest])
+                    .mapError(msg => new Exception(s"Invalid manifest: $msg"))
+      // Check for unpushed commits in each repo worktree
+      warnings <- ZIO.foreach(manifest.repos)(checkUnpushed)
+      // Push branches to remote
+      pushed   <- ZIO.foreach(manifest.repos)(pushBranch)
+      // Collect remote URLs
+      portable <- ZIO.foreach(manifest.repos)(toPortable)
+      // Collect changelogs
+      clogs     = collectChangelogs(flowType, name, manifest.repos)
+      // Collect session notes
+      snotes    = collectSessionNotes(flowType, name, manifest.sessions)
+      // Build portable task
+      pt        = PortableTask(
+                    task         = manifest.task,
+                    flowType     = manifest.flowType,
+                    description  = manifest.description,
+                    created      = manifest.created,
+                    status       = manifest.status,
+                    repos        = portable,
+                    sessions     = manifest.sessions,
+                    changelogs   = clogs,
+                    sessionNotes = snotes
+                  )
+      outFile   = better.files.File(s"${name}.ork-task.json")
+      _        <- ZIO.attempt(outFile.overwrite(pt.toJsonPretty))
+      warnText  = warnings.flatten match
+                    case Seq() => ""
+                    case ws    => "\n\nWarnings:\n" + ws.mkString("\n")
+      pushText  = pushed.flatten match
+                    case Seq() => ""
+                    case ps    => "\n\nPushed:\n" + ps.mkString("\n")
+    yield s"Exported '${flowType.branchPrefix}/$name' to ${outFile.canonicalPath}$pushText$warnText"
+
+  private def checkUnpushed(repo: RepoEntry): Task[Option[String]] =
+    val wtDir = better.files.File(repo.worktree)
+    if !wtDir.exists then ZIO.none
+    else
+      val git = ork.repo.Repos.runGit(wtDir, _)
+      for
+        ahead <- git(s"git rev-list --count origin/${repo.branch}..${repo.branch}")
+                   .map(_.trim.toInt)
+                   .catchAll(_ => ZIO.succeed(-1))
+      yield
+        if ahead > 0 then Some(s"  ${repo.name}: $ahead unpushed commit(s)")
+        else if ahead < 0 then Some(s"  ${repo.name}: remote branch not found (will be created on push)")
+        else None
+
+  private def pushBranch(repo: RepoEntry): Task[Option[String]] =
+    val originDir = better.files.File(repo.origin)
+    val git       = ork.repo.Repos.runGit(originDir, _)
+    for
+      result <- git(s"git push -u origin ${repo.branch}")
+                  .map(_ => Some(s"  ${repo.name}: ${repo.branch} → origin"))
+                  .catchAll(err => ZIO.succeed(Some(s"  ${repo.name}: push failed — ${err.getMessage}")))
+    yield result
+
+  private def toPortable(repo: RepoEntry): Task[PortableRepoEntry] =
+    val originDir = better.files.File(repo.origin)
+    val git       = ork.repo.Repos.runGit(originDir, _)
+    for
+      remote <- git("git remote get-url origin").map(_.trim)
+                  .catchAll(_ => ZIO.succeed("unknown"))
+    yield PortableRepoEntry(
+      name       = repo.name,
+      remote     = remote,
+      branch     = repo.branch,
+      baseBranch = repo.baseBranch,
+      baseCommit = repo.baseCommit
+    )
+
+  private def collectChangelogs(flowType: FlowType, taskName: String, repos: Seq[RepoEntry]): Map[String, String] =
+    val clDir = TaskPaths.taskDir(flowType, taskName) / "changelog"
+    if !clDir.exists then Map.empty
+    else
+      repos.flatMap { r =>
+        val f = clDir / s"${r.name}.md"
+        if f.exists then Some(r.name -> f.contentAsString) else None
+      }.toMap
+
+  private def collectSessionNotes(flowType: FlowType, taskName: String, sessions: Seq[SessionEntry]): Map[String, String] =
+    val sDir = TaskPaths.taskDir(flowType, taskName) / "sessions"
+    if !sDir.exists then Map.empty
+    else
+      sessions.flatMap { s =>
+        val f = sDir / s"${s.id}.md"
+        if f.exists then Some(s.id -> f.contentAsString) else None
+      }.toMap
+
+case class ImportCommand(filePath: String) extends Command:
+
+  override def execute: Task[String] =
+    val inFile = better.files.File(filePath)
+    for
+      _       <- ZIO.fail(new Exception(s"File not found: $filePath"))
+                   .when(!inFile.exists)
+      content <- ZIO.attempt(inFile.contentAsString)
+      pt      <- ZIO.fromEither(content.fromJson[PortableTask])
+                   .mapError(msg => new Exception(s"Invalid export file: $msg"))
+      ft       = pt.flowType
+      name     = pt.task
+      dir      = TaskPaths.taskDir(ft, name)
+      _       <- ZIO.fail(new Exception(s"${ft.toString} '$name' already exists locally"))
+                   .when(dir.exists)
+      config  <- TaskPaths.loadConfig
+      // Create task directory structure
+      _       <- ZIO.attempt {
+                   dir.createDirectories()
+                   TaskPaths.worktrees(ft, name).createDirectories()
+                 }
+      // Write changelogs
+      _       <- ZIO.attempt {
+                   if pt.changelogs.nonEmpty then
+                     val clDir = dir / "changelog"
+                     clDir.createDirectories()
+                     pt.changelogs.foreach { (repo, content) =>
+                       (clDir / s"$repo.md").overwrite(content)
+                     }
+                 }
+      // Write session notes
+      _       <- ZIO.attempt {
+                   if pt.sessionNotes.nonEmpty then
+                     val sDir = dir / "sessions"
+                     sDir.createDirectories()
+                     pt.sessionNotes.foreach { (id, content) =>
+                       (sDir / s"$id.md").overwrite(content)
+                     }
+                 }
+      // Resolve and create worktrees for each repo
+      entries <- ZIO.foreach(pt.repos)(importRepo(config, ft, name, _))
+      // Build local manifest
+      manifest = TaskManifest(
+                   task        = pt.task,
+                   flowType    = pt.flowType,
+                   description = pt.description,
+                   created     = pt.created,
+                   status      = TaskStatus.Active,
+                   repos       = entries,
+                   sessions    = pt.sessions
+                 )
+      branch   = manifest.branch(config.developer)
+      _       <- ZIO.attempt(TaskPaths.manifest(ft, name).overwrite(manifest.toJsonPretty))
+      // Generate supporting files
+      prompt  <- resolvePrompt(config, ft, name, branch)
+      _       <- ZIO.attempt(TaskPaths.promptFile(ft, name).overwrite(prompt))
+      _       <- ZIO.attempt(TaskPaths.mcpConfig(ft, name).overwrite(mcpJson(ft, name)))
+      _       <- ZIO.attempt(TaskPaths.log(ft, name).overwrite(s"# Task: $name\n\n## Imported\n\nImported from ${inFile.name} on ${java.time.Instant.now().toString.take(10)}\n"))
+      _       <- ZIO.attempt(ork.ide.IdeaProject.generate(ft, name, entries, config))
+      _       <- ZIO.attempt(ork.ide.VsCodeWorkspace.generate(ft, name, entries, config))
+      repoSum  = entries.map(e => s"  ${e.name}: ${e.worktree}").mkString("\n")
+    yield s"Imported '${ft.branchPrefix}/$name' with ${entries.size} repo(s)\n$repoSum"
+
+  private def importRepo(config: OrkConfig, flowType: FlowType, taskName: String, pr: PortableRepoEntry): Task[RepoEntry] =
+    val worktreeDir = TaskPaths.worktrees(flowType, taskName) / pr.name
+    for
+      repoDir    <- ork.repo.Repos.find(config, pr.name)
+                      .catchAll(_ => ZIO.fail(new Exception(
+                        s"Repository '${pr.name}' not found in configured roots. " +
+                        s"Remote: ${pr.remote}"
+                      )))
+      git         = ork.repo.Repos.runGit(repoDir, _)
+      // Fetch the branch from remote
+      _          <- git(s"git fetch origin ${pr.branch}")
+                      .catchAll(_ => ZIO.unit)
+      hasBranch  <- ork.repo.Repos.hasBranch(repoDir, pr.branch)
+      _          <- if !hasBranch
+                    then git(s"git branch ${pr.branch} origin/${pr.branch}")
+                           .catchAll(_ => ZIO.fail(new Exception(
+                             s"Branch '${pr.branch}' not found locally or on remote for '${pr.name}'"
+                           )))
+                    else ZIO.unit
+      // Create worktree
+      _          <- git(s"git worktree add ${worktreeDir.canonicalPath} ${pr.branch}")
+      baseCommit <- git(s"git rev-parse --short ${pr.baseBranch}").map(_.trim)
+                      .catchAll(_ => ZIO.succeed(pr.baseCommit))
+    yield RepoEntry(
+      name       = pr.name,
+      origin     = repoDir.canonicalPath,
+      worktree   = worktreeDir.canonicalPath,
+      branch     = pr.branch,
+      baseBranch = pr.baseBranch,
+      baseCommit = baseCommit
+    )
+
+  private def mcpJson(flowType: FlowType, name: String): String =
+    val ft = flowType.branchPrefix
+    s"""|{
+        |  "mcpServers": {
+        |    "ork": {
+        |      "command": "ork",
+        |      "args": ["mcp", "--task", "$ft/$name"]
+        |    }
+        |  }
+        |}""".stripMargin
+
+  private def resolvePrompt(config: OrkConfig, flowType: FlowType, name: String, branch: String): Task[String] =
+    val template =
+      if TaskPaths.promptTemplate.exists then
+        ZIO.attempt(TaskPaths.promptTemplate.contentAsString)
+      else
+        ZIO.succeed(defaultPromptTemplate)
+
+    template.map(_
+      .replace("{{task}}", name)
+      .replace("{{flow_type}}", flowType.toString.toLowerCase)
+      .replace("{{branch}}", branch)
+      .replace("{{base_branch}}", flowType.baseBranch)
+      .replace("{{task_dir}}", TaskPaths.taskDir(flowType, name).canonicalPath)
+      .replace("{{worktrees_dir}}", TaskPaths.worktrees(flowType, name).canonicalPath)
+    )
 
 case class CreateCommand(flowType: FlowType, name: String, initialPrompt: Option[String] = None, run: Boolean = false) extends Command:
 
